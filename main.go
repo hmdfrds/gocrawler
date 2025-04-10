@@ -38,7 +38,7 @@ func main() {
 	seedUrl := os.Args[1]
 
 	// Check if input string looks like a valid URI structure
-	parsedSeedURL, err := url.ParseRequestURI(seedUrl)
+	_, err := url.ParseRequestURI(seedUrl)
 	if err != nil {
 		log.Fatalf("Invalid seed URL format: %v", err)
 	}
@@ -59,12 +59,6 @@ func main() {
 
 	log.Printf("Crawler starting. Seed URL: %s, Domain Constraint: %s", seedUrl, seedHostname)
 
-	// --- 2. Seed the Crawl ---
-	// Mark the seed URL as visited before adding into the queue to prevent race conditions where multiple workers might try to add it.
-	visitedMutex.Lock()
-	visited[seedUrl] = true
-	visitedMutex.Unlock()
-
 	wg.Add(1)
 	taskQueue <- seedUrl
 	log.Printf("Queued initial seed URL: %s", seedUrl)
@@ -83,9 +77,8 @@ func main() {
 				log.Printf("Worker %d acquired limiter slot for: %s", workerID, urlToCrawl)
 
 				go func(urlToProcess string) {
-					log.Printf("Fetcher goroutine starting for: %s", &urlToProcess)
+					log.Printf("Fetcher goroutine starting for: %s", urlToProcess)
 					processURL(urlToProcess, &wg, &visitedMutex, visited, taskQueue, concurrencyLimiter, seedHostname)
-					wg.Done()
 				}(urlToCrawl)
 
 			}
@@ -136,6 +129,7 @@ func processURL(urlToCrawl string, wg *sync.WaitGroup, visitedMutex *sync.Mutex,
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("SKIP: Non-OK status code %d for %s", resp.StatusCode, urlToCrawl)
+		return
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -184,7 +178,7 @@ func extractAndQueueLinks(node *html.Node, base *url.URL, wg *sync.WaitGroup, vi
 						visited[absoluteURL] = true
 						wg.Add(1)
 						taskQueue <- absoluteURL
-						log.Printf("QUEUED: %s (from %s)", &absoluteURL, base.String())
+						log.Printf("QUEUED: %s (from %s)", absoluteURL, base.String())
 					}
 					visitedMutex.Unlock()
 				}
