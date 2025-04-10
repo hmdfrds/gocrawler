@@ -1,11 +1,16 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
+
+	"golang.org/x/net/html"
 )
 
 // Keys are normalized URLs, bool indicates presence.
@@ -22,7 +27,7 @@ var concurrencyLimiter = make(chan struct{}, 5) // Max 5 concurrent fetches
 // To wait for all crawl tasks to complete
 var wg sync.WaitGroup
 
-// Store the hostname of the original seed URL to ensure we stay on the same dommain.
+// Store the hostname of the original seed URL to ensure we stay on the same domain.
 var seedHostname string
 
 func main() {
@@ -79,9 +84,7 @@ func main() {
 
 				go func(urlToProcess string) {
 					log.Printf("Fetcher goroutine starting for: %s", &urlToProcess)
-					fmt.Printf("Simulating processing: %s\n", &urlToProcess)
-					log.Printf("Fetcher goroutine finished for: %s. Releasing limiter.", &urlToProcess)
-					<-concurrencyLimiter
+					processURL(urlToProcess, &wg, &visitedMutex, visited, taskQueue, concurrencyLimiter, seedHostname)
 					wg.Done()
 				}(urlToCrawl)
 
@@ -103,4 +106,113 @@ func main() {
 
 	log.Println("Crawler finished.")
 
+}
+
+func processURL(urlToCrawl string, wg *sync.WaitGroup, visitedMutex *sync.Mutex, visited map[string]bool, taskQueue chan<- string, limiter chan struct{}, baseHostname string) {
+	defer wg.Done()
+	defer func() {
+		<-limiter
+		log.Printf("Limiter slot released for: %s", urlToCrawl)
+	}()
+
+	visitedMutex.Lock()
+	if _, exists := visited[urlToCrawl]; exists {
+		visitedMutex.Unlock()
+		log.Printf("Skipping already visited (in-flight check): %s", urlToCrawl)
+		return
+	}
+	visited[urlToCrawl] = true
+	visitedMutex.Unlock()
+
+	log.Printf("Fetching: %s", urlToCrawl)
+
+	resp, err := http.Get(urlToCrawl)
+	if err != nil {
+		log.Printf("ERROR: Failed to fetch %s: %v", urlToCrawl, err)
+		return
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("SKIP: Non-OK status code %d for %s", resp.StatusCode, urlToCrawl)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "text/html") {
+		log.Printf("SKIP: Non-HTML content type '%s' for %s", contentType, urlToCrawl)
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR: Failed to read body for %s: %v", urlToCrawl, err)
+		return
+	}
+
+	doc, err := html.Parse(bytes.NewReader(bodyBytes))
+	if err != nil {
+		log.Printf("Error: Failed to parse HTML for %s: %v", urlToCrawl, err)
+		return
+	}
+
+	baseParsedURL, _ := url.Parse(urlToCrawl)
+
+	log.Printf("Parsing links on: %s", urlToCrawl)
+	extractAndQueueLinks(doc, baseParsedURL, wg, visitedMutex, visited, taskQueue, baseHostname)
+	log.Printf("Finished processing: %s", urlToCrawl)
+}
+
+func extractAndQueueLinks(node *html.Node, base *url.URL, wg *sync.WaitGroup, visitedMutex *sync.Mutex, visited map[string]bool, taskQueue chan<- string, baseHostname string) {
+	if node == nil {
+		return
+	}
+
+	if node.Type == html.ElementNode && node.Data == "a" {
+		for _, attr := range node.Attr {
+			if attr.Key == "href" {
+				href := strings.TrimSpace(attr.Val)
+				if href == "" {
+					continue
+				}
+
+				absoluteURL := resolveAndFilter(href, base, baseHostname)
+
+				if absoluteURL != "" {
+					visitedMutex.Lock()
+					if _, exists := visited[absoluteURL]; !exists {
+						visited[absoluteURL] = true
+						wg.Add(1)
+						taskQueue <- absoluteURL
+						log.Printf("QUEUED: %s (from %s)", &absoluteURL, base.String())
+					}
+					visitedMutex.Unlock()
+				}
+				break
+			}
+		}
+	}
+
+	for c := node.FirstChild; c != nil; c = c.NextSibling {
+		extractAndQueueLinks(c, base, wg, visitedMutex, visited, taskQueue, baseHostname)
+	}
+}
+
+func resolveAndFilter(href string, base *url.URL, baseHostname string) string {
+	resolvedURL, err := base.Parse(href)
+	if err != nil {
+		return ""
+	}
+
+	if resolvedURL.Scheme != "http" && resolvedURL.Scheme != "https" {
+		return ""
+	}
+
+	if resolvedURL.Hostname() != baseHostname {
+		return ""
+	}
+
+	resolvedURL.Fragment = ""
+
+	return resolvedURL.String()
 }
